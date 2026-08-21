@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!--
+  Nothing in this app talks to anything but itself: no analytics, no fonts, no
+  CDN, no remote images. The policy says so explicitly, so a mistake later — a
+  pasted script tag, an injected string that reaches innerHTML — fails instead
+  of quietly exfiltrating a training log.
+
+  'unsafe-inline' is needed for style only: the charts set colours and widths as
+  inline attributes. Script has no such allowance, which is the half that
+  matters. frame-ancestors and X-Frame-Options cannot be set from a meta tag;
+  they are served as headers where the host allows it.
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; manifest-src 'self'; worker-src 'self'; media-src 'self' blob:; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#1a1a19">
+<title>Bulk</title>
+<link rel="stylesheet" href="./css/app.css">
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="apple-touch-icon" href="./icons/icon-192-v2.png">
+<!-- Declared so the browser stops asking for /favicon.ico, which does not exist
+     and which the service worker would otherwise be asked about on every load. -->
+<link rel="icon" href="./icons/icon-192-v2.png" type="image/png">
+</head>
+<body>
+<div class="top" id="top"><div class="row">
+  <div class="idt"><h1 id="ttl">Bulk</h1><button class="ver" id="ver" data-act="about-build" aria-label="Which build is running"></button></div>
+  <button class="chip" id="chip" data-act="chip-tap"></button>
+  <!-- The timer, from anywhere. Blue and round like the bubble it opens, so the
+       two read as the same object. -->
+  <button class="tmr" data-act="open-timer" aria-label="Timer" title="Timer"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2M9 2h6M18.5 5.5l1.5 1.5"/></svg></button>
+  <button class="gear" data-act="settings" aria-label="Settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 7 19.4a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H1a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 2.6 7a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H7a1.7 1.7 0 0 0 1-1.5V1a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V7a1.7 1.7 0 0 0 1.5 1H23a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" transform="translate(0.5,0.5) scale(0.96)"/></svg></button>
+</div>
+<div class="demostrip" id="demostrip" hidden><b>DEMO DATA</b> · nothing here is real<button data-act="demo-off">Back to my data</button></div>
+</div>
+
+<div class="wrap" id="view"></div>
+
+<!--
+  The timer, in three states.
+
+  closed  — nothing on screen; the Timer control on Train opens it
+  bubble  — a small draggable blue disc showing the reading, out of the way
+  full    — about half the screen, with everything needed to drive it
+
+  It never closes itself. A countdown that reaches zero stays on screen saying
+  so, because a timer that vanishes at the moment you look up from a set is the
+  same as no timer at all.
+-->
+<div class="rest" id="rest">
+  <button class="bub" id="rest-bubble" data-act="rest-expand" aria-label="Open the timer">
+    <span class="bt" id="rt-b">3:00</span>
+  </button>
+
+  <div class="panel">
+    <div class="phead">
+      <div class="pl" id="rl">Rest</div>
+      <div class="pbtns">
+        <button data-act="rest-collapse" aria-label="Minimise the timer" title="Minimise">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 13h14"/></svg>
+        </button>
+        <button data-act="rest-skip" aria-label="Close the timer" title="Close">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="pt" id="rt">3:00</div>
+    <div class="pdone" id="rdone">Time is up</div>
+
+    <div class="rmode">
+      <button data-act="rest-mode" data-id="rest">Count down</button>
+      <button data-act="rest-mode" data-id="stopwatch">Count up</button>
+    </div>
+
+    <div class="rpresets" id="rpresets">
+      <button data-act="rest-preset" data-sec="60">1:00</button>
+      <button data-act="rest-preset" data-sec="90">1:30</button>
+      <button data-act="rest-preset" data-sec="120">2:00</button>
+      <button data-act="rest-preset" data-sec="180">3:00</button>
+      <button data-act="rest-preset" data-sec="240">4:00</button>
+      <button data-act="rest-preset" data-sec="300">5:00</button>
+    </div>
+
+    <div class="radjust" id="radjust">
+      <button data-act="rest-adjust" data-sec="-30">&minus;30s</button>
+      <button data-act="rest-adjust" data-sec="30">+30s</button>
+      <button data-act="rest-custom">Custom…</button>
+    </div>
+
+    <div class="rbig">
+      <button class="prime" id="rest-toggle" data-act="rest-toggle">Pause</button>
+      <button data-act="rest-reset">Reset</button>
+    </div>
+
+    <label class="rnote"><input type="checkbox" id="rest-notify" data-act-change="rest-notify"><span>Tell me when it is up</span></label>
+  </div>
+</div>
+
+<div class="sheet" id="sheet"><div class="bg" data-act="sheet-close"></div><div class="pan" id="pan"></div></div>
+
+<nav>
+  <button id="n-train" data-act="tab" data-tab="train"><svg viewBox="0 0 24 24"><path d="M6.5 6.5v11M17.5 6.5v11M3 9v6M21 9v6M6.5 12h11"/></svg>Train</button>
+  <button id="n-body" data-act="tab" data-tab="body"><svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="2.6"/><path d="M12 7.6v7M12 14.6l-3 6.4M12 14.6l3 6.4M7 10.5l5-1 5 1"/></svg>Body</button>
+  <button id="n-prog" data-act="tab" data-tab="prog"><svg viewBox="0 0 24 24"><path d="M4 19V5M4 19h16M7.5 15l3.5-4.5 3 2.5L20 7"/></svg>Progress</button>
+  <button id="n-plan" data-act="tab" data-tab="plan"><svg viewBox="0 0 24 24"><path d="M5 4h14v16H5zM9 8.5h6M9 12h6M9 15.5h4"/></svg>Plan</button>
+  <button id="n-log" data-act="tab" data-tab="log"><svg viewBox="0 0 24 24"><path d="M12 7v5l3.5 2"/><circle cx="12" cy="12" r="8.5"/></svg>Log</button>
+</nav>
+
+<script type="module" src="./js/app.js"></script>
+</body>
+</html>
