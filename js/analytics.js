@@ -1,0 +1,904 @@
+/**
+ * analytics.js — one auditable pipeline for every number the app claims.
+ *
+ * v1 computed metrics inside the drawing code, which is how it ended up
+ * asserting things its own numbers contradicted: a rate called "on target" when
+ * it was outside the band, a four-week change that hid a recent decline behind
+ * an old all-time best, a block comparison that turned regressions into gains,
+ * and series aligned by array position so a missing week paired unrelated
+ * observations.
+ *
+ * Every function here takes records and returns a metric object that carries
+ * its own evidence: the window it used, how many samples it had, what it
+ * excluded and why. The UI renders those objects. It never calculates.
+ *
+ * Pure: records in, metrics out.
+ */
+
+import { estimateForSet, isHighConfidence, systemLoad, e1rm, setDifficulty, noEstimateReason } from './calc.js';
+import { daysBetween, weekStart } from './dates.js';
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Eligibility — said out loud, every time
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Which sets may be used as evidence about strength, and why the others cannot.
+ *
+ * The rules are the plan's own: index sets on high-confidence lifts, performed
+ * under the standard technique, not during a deload, and with an effort rating
+ * the RPE table can actually express.
+ */
+export function eligibleForStrength(sets, { exercises, logs = [] }) {
+  const byLog = new Map(logs.map((log) => [log.id, log]));
+  const included = [];
+  const excluded = [];
+
+  for (const set of sets || []) {
+    const exercise = exercises[set.exerciseId];
+    const log = byLog.get(set.sessionLogId);
+    const reject = (reason) => excluded.push({ id: set.id, exerciseId: set.exerciseId, reason });
+
+    if (set.deletedAtISO) { reject('deleted'); continue; }
+    // The gate that makes the flag mean something: a set marked as form
+    // breakdown cannot move a working max, and the exclusion is reported with
+    // its reason like every other one here.
+    if (set.formBreakdown) { reject('form breakdown'); continue; }
+    if (!exercise) { reject('unknown exercise'); continue; }
+    if (!set.isIndexSet) { reject('not an index set'); continue; }
+    if (!exercise.tracksMax || exercise.maxConf !== 'high') { reject('estimates on this lift are indicative only'); continue; }
+    if (set.load == null || !set.reps) { reject('incomplete set'); continue; }
+    if (!log) { reject('its session record is gone'); continue; }
+    if (log.deletedAtISO) { reject('the session was deleted'); continue; }
+    if (log.isDeload || log.effortMode === 'none') { reject('deload rotation'); continue; }
+    if (set.substitutionReason || set.variantUsed) { reject('a substitute was used'); continue; }
+
+    const estimate = estimateForSet(set);
+    if (!isHighConfidence(estimate)) { reject(estimate?.reason || 'no usable effort rating'); continue; }
+
+    included.push({ set, estimate, log });
+  }
+
+  return { included, excluded };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Series, aligned on real dates
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/** e1RM points for one lift: { dateISO, cycleSequence, value }, oldest first. */
+export function strengthSeries(sets, { exercises, logs, exerciseId }) {
+  const { included, excluded } = eligibleForStrength(
+    sets.filter((set) => set.exerciseId === exerciseId),
+    { exercises, logs }
+  );
+
+  const points = included
+    .map(({ set, estimate, log }) => ({
+      dateISO: (log?.localDate || log?.dateISO || set.localDate || '').slice(0, 10),
+      cycleSequence: log?.cycleSequence ?? null,
+      blockId: log?.blockId ?? null,
+      sessionId: log?.sessionId ?? null,
+      value: estimate.value,
+      setId: set.id,
+      reps: set.reps,
+      load: set.load,
+      rpe: set.rpe,
+    }))
+    .filter((point) => point.dateISO)
+    .sort((a, b) => a.dateISO.localeCompare(b.dateISO));
+
+  return { points, excluded, sampleCount: points.length };
+}
+
+/**
+ * Best per cycle, which is the resolution the signal actually has.
+ *
+ * Training analytics group by cycle, not by calendar week: a rotation that took
+ * nine days is one training unit, not two thirds of one week plus a third of
+ * the next.
+ */
+export function bestPerCycle(points) {
+  const byCycle = new Map();
+  for (const point of points) {
+    if (point.cycleSequence == null) continue;
+    const held = byCycle.get(point.cycleSequence);
+    if (!held || point.value > held.value) byCycle.set(point.cycleSequence, point);
+  }
+  return [...byCycle.values()].sort((a, b) => a.cycleSequence - b.cycleSequence);
+}
+
+/** Best per calendar week, for anything genuinely tied to dates. */
+export function bestPerWeek(points) {
+  const byWeek = new Map();
+  for (const point of points) {
+    const week = weekStart(point.dateISO);
+    const held = byWeek.get(week);
+    if (!held || point.value > held.value) byWeek.set(week, { ...point, weekISO: week });
+  }
+  return [...byWeek.values()].sort((a, b) => a.weekISO.localeCompare(b.weekISO));
+}
+
+/**
+ * Two series joined on their dates rather than their positions.
+ *
+ * v1's indexed chart walked both arrays by array index, so a missing weigh-in
+ * silently paired a bodyweight with the wrong week's strength.
+ */
+export function alignByDate(a, b) {
+  const bByDate = new Map(b.map((point) => [point.dateISO, point]));
+  return a
+    .map((point) => ({ dateISO: point.dateISO, a: point.value, b: bByDate.get(point.dateISO)?.value ?? null }))
+    .filter((row) => row.a != null || row.b != null);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Trends
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/** Least-squares slope per week, with the evidence it rests on. */
+export function trend(points, { minSamples = 3, minDays = 14, label = 'trend' } = {}) {
+  const clean = (points || []).filter((p) => Number.isFinite(p.value) && p.dateISO);
+  if (clean.length < minSamples) {
+    return { ok: false, reason: `needs at least ${minSamples} points, has ${clean.length}`, sampleCount: clean.length, label };
+  }
+
+  const first = clean[0].dateISO;
+  const spanDays = daysBetween(first, clean[clean.length - 1].dateISO);
+  if (spanDays < minDays) {
+    return { ok: false, reason: `needs at least ${minDays} days, has ${spanDays}`, sampleCount: clean.length, spanDays, label };
+  }
+
+  const xs = clean.map((p) => daysBetween(first, p.dateISO) / 7);
+  const ys = clean.map((p) => p.value);
+  const meanX = xs.reduce((a, b) => a + b, 0) / xs.length;
+  const meanY = ys.reduce((a, b) => a + b, 0) / ys.length;
+
+  let top = 0;
+  let bottom = 0;
+  for (let i = 0; i < xs.length; i++) {
+    top += (xs[i] - meanX) * (ys[i] - meanY);
+    bottom += (xs[i] - meanX) ** 2;
+  }
+  if (bottom === 0) return { ok: false, reason: 'every point falls on the same day', sampleCount: clean.length, label };
+
+  const slope = top / bottom;
+  const intercept = meanY - slope * meanX;
+
+  // How much of the variation the line actually explains. A slope from four
+  // noisy points deserves to be labelled as such.
+  const predicted = xs.map((x) => intercept + slope * x);
+  const ssRes = ys.reduce((sum, y, i) => sum + (y - predicted[i]) ** 2, 0);
+  const ssTot = ys.reduce((sum, y) => sum + (y - meanY) ** 2, 0);
+  const fit = ssTot === 0 ? 0 : 1 - ssRes / ssTot;
+
+  return {
+    ok: true,
+    label,
+    perWeek: slope,
+    current: ys[ys.length - 1],
+    sampleCount: clean.length,
+    spanDays,
+    fit: Math.round(fit * 100) / 100,
+    confidence: clean.length >= 8 && fit > 0.4 ? 'good' : clean.length >= 5 ? 'fair' : 'weak',
+  };
+}
+
+/**
+ * Trailing average over a window of days, not of samples.
+ *
+ * A sliding window rather than a backward scan per point. The scan is fine for
+ * one weigh-in a day, where it stops after seven — and quadratic the moment
+ * several readings share a date, which is exactly what a set-level series
+ * looks like. Day numbers are computed once, because the cost here is parsing
+ * dates, not adding numbers.
+ */
+export function rollingMean(points, windowDays = 7) {
+  const clean = (points || [])
+    .filter((p) => Number.isFinite(p.value))
+    .sort((a, b) => a.dateISO.localeCompare(b.dateISO));
+
+  const days = clean.map((p) => Math.round(Date.parse(`${p.dateISO.slice(0, 10)}T00:00:00Z`) / 86400000));
+
+  const out = [];
+  let start = 0;
+  let sum = 0;
+  for (let i = 0; i < clean.length; i++) {
+    sum += clean[i].value;
+    while (days[i] - days[start] >= windowDays) {
+      sum -= clean[start].value;
+      start += 1;
+    }
+    out.push({ dateISO: clean[i].dateISO, value: sum / (i - start + 1), samples: i - start + 1 });
+  }
+  return out;
+}
+
+/**
+ * Change over a real interval, measured from comparable estimates at both ends.
+ *
+ * v1 subtracted the value four points ago from the all-time best, so a recent
+ * decline was invisible behind an old peak.
+ */
+export function changeOver(points, { weeks = 4 } = {}) {
+  if (!points.length) return { ok: false, reason: 'nothing logged' };
+
+  const latest = points[points.length - 1];
+  const targetDays = weeks * 7;
+  const earlier = [...points]
+    .reverse()
+    .find((point) => daysBetween(point.dateISO, latest.dateISO) >= targetDays);
+
+  if (!earlier) {
+    return { ok: false, reason: `no comparable point ${weeks} weeks back`, sampleCount: points.length };
+  }
+  return {
+    ok: true,
+    change: latest.value - earlier.value,
+    from: earlier.value,
+    to: latest.value,
+    fromDateISO: earlier.dateISO,
+    toDateISO: latest.dateISO,
+    actualDays: daysBetween(earlier.dateISO, latest.dateISO),
+  };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Decisions
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/** Bodyweight targets, as a share of bodyweight per week. */
+export const GAIN_ACTIONS = Object.freeze({ low: 0.1, high: 0.6 });
+
+export const GAIN_TARGETS = Object.freeze({
+  early: { lo: 0.4, hi: 0.5, throughWeek: 12 },
+  late: { lo: 0.2, hi: 0.25 },
+});
+
+/**
+ * Is the bulk running at the intended rate?
+ *
+ * v1 called anything between 25% of the lower bound and 140% of the upper one
+ * "on target", then printed the actual band as though the number sat inside it.
+ * This compares against the real bounds and says which side it is on.
+ */
+export function gainRateVerdict(bodyweightPoints, { calendarWeek = 1, targets = GAIN_TARGETS, ACT = GAIN_ACTIONS } = {}) {
+  const averaged = rollingMean(bodyweightPoints, 7);
+  const recent = averaged.filter(
+    (point) => daysBetween(point.dateISO, averaged[averaged.length - 1]?.dateISO ?? point.dateISO) <= 21
+  );
+  const result = trend(recent, { minSamples: 8, minDays: 14, label: 'bodyweight' });
+  if (!result.ok) return { ok: false, reason: result.reason, sampleCount: result.sampleCount };
+
+  const target = calendarWeek <= targets.early.throughWeek ? targets.early : targets.late;
+  const perWeek = result.perWeek;
+  const status = perWeek < target.lo ? 'under' : perWeek > target.hi ? 'over' : 'in';
+
+  return {
+    ok: true,
+    perWeek,
+    target,
+    status,
+    sampleCount: result.sampleCount,
+    spanDays: result.spanDays,
+    confidence: result.confidence,
+    // The plan names a band and, separately, the rates at which it says to
+    // actually change what you eat. Between the two the answer is to wait: a
+    // slope from three weeks of scale readings is mostly noise.
+    action:
+      perWeek < ACT.low
+        ? 'Add about 250 kcal — one extra meal-sized snack.'
+        : perWeek > ACT.high
+          ? 'Cut about 300 kcal.'
+          : status === 'in'
+            ? 'Nothing to change. Re-read in two to three weeks.'
+            : status === 'under'
+              ? 'Not far enough off to act on. Re-read in two weeks before changing anything.'
+              : 'Not far enough off to act on. Watch the waist trend rather than the scale.',
+  };
+}
+
+/**
+ * Distance to a goal, always computed in kilograms.
+ *
+ * v1 projected toward the number 140 and then labelled it with the display
+ * unit, so pounds mode promised "140 lb" while calculating 308.6.
+ */
+export function goalProgress(points, { goalKg = 140 } = {}) {
+  if (!points.length) return { ok: false, reason: 'no index sets yet', goalKg };
+
+  const current = points[points.length - 1].value;
+  const result = trend(points, { minSamples: 5, minDays: 21, label: 'strength' });
+  const remaining = goalKg - current;
+
+  if (!result.ok || result.perWeek <= 0) {
+    return { ok: true, goalKg, current, remaining, projection: null, reason: result.reason ?? 'not currently rising' };
+  }
+
+  // A range, not a date. Extrapolating a promise from a handful of noisy weeks
+  // is how an app loses trust the first time it is wrong.
+  const optimistic = remaining / (result.perWeek * 1.3);
+  const pessimistic = remaining / (result.perWeek * 0.7);
+
+  return {
+    ok: true,
+    goalKg,
+    current,
+    remaining,
+    perWeek: result.perWeek,
+    confidence: result.confidence,
+    sampleCount: result.sampleCount,
+    projection: { lowWeeks: Math.max(1, Math.round(optimistic)), highWeeks: Math.round(pessimistic) },
+  };
+}
+
+/**
+ * Change per block, using chronological endpoints.
+ *
+ * v1 took the minimum as "first" and the maximum as "last", which converted
+ * every regression into a gain, and kept only the first lift it encountered.
+ */
+export function blockComparison(sets, { exercises, logs, lifts }) {
+  const rows = [];
+
+  // One pass per lift over sets already indexed by log — no nested lookups, so
+  // this stays linear at six thousand sets rather than quadratic.
+  for (const lift of lifts) {
+    const { points } = strengthSeries(sets, { exercises, logs, exerciseId: lift.id });
+    const byBlock = new Map();
+
+    for (const point of points) {
+      if (point.blockId == null) continue;
+      if (!byBlock.has(point.blockId)) byBlock.set(point.blockId, []);
+      byBlock.get(point.blockId).push(point);
+    }
+
+    for (const [blockId, blockPoints] of byBlock) {
+      const ordered = blockPoints.sort((a, b) => a.dateISO.localeCompare(b.dateISO));
+      if (ordered.length < 2) {
+        rows.push({ lift: lift.id, name: lift.name, blockId, change: null, sampleCount: ordered.length, reason: 'one observation' });
+        continue;
+      }
+      rows.push({
+        lift: lift.id,
+        name: lift.name,
+        blockId,
+        first: ordered[0].value,
+        firstDateISO: ordered[0].dateISO,
+        last: ordered[ordered.length - 1].value,
+        lastDateISO: ordered[ordered.length - 1].dateISO,
+        change: ordered[ordered.length - 1].value - ordered[0].value,
+        sampleCount: ordered.length,
+      });
+    }
+  }
+
+  return rows.sort((a, b) => a.blockId - b.blockId || a.name.localeCompare(b.name));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   One session, in full
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Everything about a single session that can be derived from what it stored.
+ *
+ * The Log could show you a session's sets and nothing else — not what it
+ * actually hit, not how it compared with the last time you did it, not where
+ * the work went. All of that is computable from rows already in the database.
+ *
+ * Nothing here estimates anything it cannot justify: tonnage is exact
+ * arithmetic on stored numbers, e1RM and difficulty come back null past the
+ * rep limit rather than guessing, and the comparison is omitted entirely when
+ * there is no earlier session of the same letter to compare with.
+ */
+export function sessionAnalysis(log, sets, { exercises = {}, logs = [], allSets = [] } = {}) {
+  const live = (sets || []).filter((set) => !set.deletedAtISO);
+
+  const byExercise = new Map();
+  let tonnage = 0;
+  let reps = 0;
+  let workingSets = 0;
+  let failureSets = 0;
+
+  for (const set of live) {
+    const exercise = exercises[set.exerciseId];
+    const bodyweight = set.bodyweightUsed || 0;
+    // Tonnage is what the muscles moved, so bodyweight counts on a pull-up.
+    const total = systemLoad(set.load ?? 0, bodyweight);
+    const setTonnage = total * (set.reps || 0);
+
+    tonnage += setTonnage;
+    reps += set.reps || 0;
+    workingSets += 1;
+    if (set.toFailure || set.isAmrap) failureSets += 1;
+
+    const entry = byExercise.get(set.exerciseId) || {
+      exerciseId: set.exerciseId,
+      name: exercise?.name || set.exerciseId,
+      sets: [],
+      tonnage: 0,
+      reps: 0,
+      topLoad: null,
+      bestEstimate: null,
+      bestDifficulty: null,
+    };
+    entry.sets.push(set);
+    entry.tonnage += setTonnage;
+    entry.reps += set.reps || 0;
+    if (entry.topLoad == null || total > entry.topLoad) entry.topLoad = total;
+
+    const estimate = e1rm(total, set.reps, Math.min(10, set.rpe ?? 8));
+    if (estimate != null && (entry.bestEstimate == null || estimate > entry.bestEstimate)) {
+      entry.bestEstimate = estimate;
+    }
+    const hard = setDifficulty(total, set.reps);
+    if (hard != null && (entry.bestDifficulty == null || hard > entry.bestDifficulty)) {
+      entry.bestDifficulty = hard;
+    }
+    byExercise.set(set.exerciseId, entry);
+  }
+
+  return {
+    tonnage,
+    reps,
+    workingSets,
+    failureSets,
+    exercises: [...byExercise.values()].sort((a, b) => b.tonnage - a.tonnage),
+    previous: previousSameSession(log, { logs, allSets, exercises }),
+  };
+}
+
+/**
+ * The last time this same session letter was trained, and what changed.
+ *
+ * Compared per exercise rather than in total, because a session's tonnage moves
+ * with the reps you happened to get as much as with the load — and per
+ * exercise, "same lift, more weight" is a fact rather than an impression.
+ * Returns null when there is nothing to compare against, which is the honest
+ * answer for a first session and the one v1 would have filled with a zero.
+ */
+function previousSameSession(log, { logs, allSets, exercises }) {
+  if (!log?.sessionId) return null;
+
+  const earlier = (logs || [])
+    .filter(
+      (row) =>
+        !row.deletedAtISO &&
+        row.id !== log.id &&
+        row.sessionId === log.sessionId &&
+        (row.dateISO || '') < (log.dateISO || '')
+    )
+    .sort((a, b) => (b.dateISO || '').localeCompare(a.dateISO || ''));
+
+  const previous = earlier[0];
+  if (!previous) return null;
+
+  const previousSets = (allSets || []).filter((set) => set.sessionLogId === previous.id && !set.deletedAtISO);
+  if (!previousSets.length) return null;
+
+  const summarise = (rows) => {
+    const map = new Map();
+    for (const set of rows) {
+      const total = systemLoad(set.load ?? 0, set.bodyweightUsed || 0);
+      const entry = map.get(set.exerciseId) || { tonnage: 0, topLoad: null, sets: 0 };
+      entry.tonnage += total * (set.reps || 0);
+      entry.sets += 1;
+      if (entry.topLoad == null || total > entry.topLoad) entry.topLoad = total;
+      map.set(set.exerciseId, entry);
+    }
+    return map;
+  };
+
+  const now = summarise((allSets || []).filter((set) => set.sessionLogId === log.id && !set.deletedAtISO));
+  const then = summarise(previousSets);
+
+  const rows = [];
+  for (const [exerciseId, current] of now) {
+    const before = then.get(exerciseId);
+    if (!before) continue;
+    rows.push({
+      exerciseId,
+      name: exercises[exerciseId]?.name || exerciseId,
+      topLoadChange: current.topLoad - before.topLoad,
+      tonnageChange: current.tonnage - before.tonnage,
+      topLoadNow: current.topLoad,
+      topLoadThen: before.topLoad,
+    });
+  }
+
+  return {
+    dateISO: (previous.dateISO || '').slice(0, 10),
+    daysBefore: Math.round(
+      (Date.parse(`${(log.dateISO || '').slice(0, 10)}T00:00:00Z`) -
+        Date.parse(`${(previous.dateISO || '').slice(0, 10)}T00:00:00Z`)) /
+        86400000
+    ),
+    rows: rows.sort((a, b) => b.topLoadChange - a.topLoadChange),
+  };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Session timing
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Gaps shorter than this are not rest — they are two rows filled in together.
+ * Used to notice a session typed up afterwards rather than logged as it
+ * happened, so the app can say the timing is not meaningful instead of
+ * reporting eight seconds of rest between working sets.
+ */
+export const MIN_REAL_REST_SECONDS = 20;
+
+/**
+ * A gap longer than this is almost certainly not rest between sets — a phone
+ * call, a queue for a rack, or the session being picked up again later. Still
+ * reported, because it is real; just not counted into the typical rest.
+ */
+export const LONG_GAP_SECONDS = 20 * 60;
+
+/**
+ * A session start this much earlier than its first set did not begin then.
+ *
+ * From a real log: `startedAt` 11:14, first set 16:30, and the session reported
+ * as eight hours. The log is created by the first thing you do, and un-ticking
+ * a set deletes the set but leaves the log — so a tap in the morning that was
+ * undone still stamped the session five hours before the training happened.
+ * Reported rather than quietly corrected, with the working span offered beside
+ * it, because which of the two is right is a question only the owner can answer.
+ */
+export const IMPLAUSIBLE_START_SECONDS = 45 * 60;
+
+/**
+ * What actually happened, minute by minute, from the timestamps already stored.
+ *
+ * Every set has carried a `timestampISO` since the first version and nothing
+ * has ever read it. The times are therefore free — this derives rest between
+ * sets, working time and session length from data already in the database,
+ * including for sessions logged long before the report existed.
+ *
+ * The whole thing is conditional on the timing being real. A session typed up
+ * on the bus home has timestamps a few seconds apart, and reporting "8 s of
+ * rest" from them would be worse than reporting nothing: it looks like a
+ * measurement. `reliable` is false when the owner has said so, and
+ * `looksBulkEntered` is true when the gaps say so regardless of what anyone
+ * said, so a screen can decline to draw conclusions from it.
+ */
+export function sessionTiming(log, sets, { now = null } = {}) {
+  const ordered = (sets || [])
+    .filter((set) => !set.deletedAtISO && set.timestampISO)
+    .sort((a, b) => a.timestampISO.localeCompare(b.timestampISO));
+
+  const stated = log?.timingReliable;
+  const startedAt = log?.startedAt || ordered[0]?.timestampISO || null;
+  const endedAt = log?.endedAt || (log && !log.endedAt ? now : null) || ordered[ordered.length - 1]?.timestampISO || null;
+
+  const entries = ordered.map((set, i) => {
+    const at = Date.parse(set.timestampISO);
+    const previous = i ? Date.parse(ordered[i - 1].timestampISO) : startedAt ? Date.parse(startedAt) : null;
+    const gapSeconds = previous == null || !Number.isFinite(at) ? null : Math.max(0, Math.round((at - previous) / 1000));
+    return {
+      setId: set.id,
+      exerciseId: set.exerciseId,
+      slotIndex: set.slotIndex,
+      setIndex: set.setIndex,
+      atISO: set.timestampISO,
+      gapSeconds,
+      isFirst: i === 0,
+      isLongGap: gapSeconds != null && gapSeconds > LONG_GAP_SECONDS,
+    };
+  });
+
+  // Gaps between one set and the next — the first entry's gap is warm-up time
+  // from the session start, which is not rest between sets.
+  const gaps = entries.slice(1).map((entry) => entry.gapSeconds).filter((g) => g != null);
+  const restGaps = gaps.filter((g) => g >= MIN_REAL_REST_SECONDS && g <= LONG_GAP_SECONDS);
+
+  // More than half the gaps too short to be rest means the rows were filled in
+  // together, whatever the session log claims.
+  const tooShort = gaps.filter((g) => g < MIN_REAL_REST_SECONDS).length;
+  const looksBulkEntered = gaps.length >= 3 && tooShort / gaps.length > 0.5;
+
+  const totalSeconds =
+    startedAt && endedAt ? Math.max(0, Math.round((Date.parse(endedAt) - Date.parse(startedAt)) / 1000)) : null;
+
+  // First set to last: the span the work actually occupied, whatever the log
+  // says about when it opened.
+  const firstSetAt = ordered[0]?.timestampISO || null;
+  const lastSetAt = ordered[ordered.length - 1]?.timestampISO || null;
+  const workingSpanSeconds =
+    firstSetAt && lastSetAt ? Math.max(0, Math.round((Date.parse(lastSetAt) - Date.parse(firstSetAt)) / 1000)) : null;
+  const startedBeforeFirstSetSeconds =
+    startedAt && firstSetAt ? Math.round((Date.parse(firstSetAt) - Date.parse(startedAt)) / 1000) : null;
+  const startLooksWrong =
+    startedBeforeFirstSetSeconds != null && startedBeforeFirstSetSeconds > IMPLAUSIBLE_START_SECONDS;
+
+  const sorted = [...restGaps].sort((a, b) => a - b);
+  const reliable = stated === false ? false : !looksBulkEntered;
+
+  /*
+   * When the timing is not real, the derived figures are not merely hidden —
+   * they are not returned. A metric object that carries a median it has just
+   * said is meaningless is one screen away from printing it, and this file's
+   * whole reason for existing is that a view should not have to know which of
+   * the numbers it was handed are safe to show.
+   */
+  const derived = reliable
+    ? {
+        totalSeconds,
+        medianRestSeconds: sorted.length ? sorted[Math.floor(sorted.length / 2)] : null,
+        longestRestSeconds: restGaps.length ? Math.max(...restGaps) : null,
+        shortestRestSeconds: restGaps.length ? Math.min(...restGaps) : null,
+        countedRests: restGaps.length,
+      }
+    : {
+        totalSeconds: null,
+        medianRestSeconds: null,
+        longestRestSeconds: null,
+        shortestRestSeconds: null,
+        countedRests: 0,
+      };
+
+  return {
+    reliable,
+    statedUnreliable: stated === false,
+    looksBulkEntered,
+    startedAt,
+    endedAt,
+    firstSetAt,
+    lastSetAt,
+    workingSpanSeconds,
+    startedBeforeFirstSetSeconds,
+    startLooksWrong,
+    setCount: entries.length,
+    // The timeline itself is always returned: when each row was written is a
+    // fact either way, and it is what shows you *why* the timing is not real.
+    entries,
+    longGaps: entries.filter((entry) => entry.isLongGap && !entry.isFirst).length,
+    ...derived,
+  };
+}
+
+/**
+ * How a record got to where it is.
+ *
+ * The records card showed the current best and the date it was set, which
+ * answers "what is my best" and nothing else. It cannot tell you whether a
+ * record is three days old or four months old, how hard it was to beat, or
+ * whether it has been creeping up steadily or jumped once and stalled — which
+ * is the question you actually have when you look at it.
+ *
+ * This walks the sets in date order and emits an entry every time the running
+ * best is beaten, so what comes back is the staircase rather than the top step.
+ * Each rung carries what it gained on the one below and how long it took, both
+ * of which are facts about the pair rather than about either one.
+ */
+export function recordHistory(sets, { exercises, logs }) {
+  const byLog = new Map(logs.map((log) => [log.id, log]));
+
+  const dated = (sets || [])
+    .filter((set) => !set.deletedAtISO && set.load != null && set.reps)
+    .map((set) => ({ set, dateISO: (byLog.get(set.sessionLogId)?.localDate || byLog.get(set.sessionLogId)?.dateISO || '').slice(0, 10) }))
+    .filter((row) => row.dateISO)
+    .sort((a, b) => a.dateISO.localeCompare(b.dateISO));
+
+  const heaviest = new Map();
+  const estimated = new Map();
+
+  const push = (map, key, entry) => {
+    const list = map.get(key) || [];
+    const previous = list[list.length - 1];
+    if (previous) {
+      entry.gain = entry.value - previous.value;
+      entry.daysSince = Math.round(
+        (Date.parse(`${entry.dateISO}T00:00:00Z`) - Date.parse(`${previous.dateISO}T00:00:00Z`)) / 86400000
+      );
+    }
+    list.push(entry);
+    map.set(key, list);
+  };
+
+  for (const { set, dateISO } of dated) {
+    const exercise = exercises[set.exerciseId];
+    if (!exercise) continue;
+
+    const heavyList = heaviest.get(set.exerciseId);
+    const bestLoad = heavyList ? heavyList[heavyList.length - 1].value : -Infinity;
+    if (set.load > bestLoad) {
+      push(heaviest, set.exerciseId, { dateISO, value: set.load, load: set.load, reps: set.reps, rpe: set.rpe ?? null });
+    }
+
+    if (set.isIndexSet && exercise.maxConf === 'high') {
+      const estimate = estimateForSet(set);
+      if (isHighConfidence(estimate)) {
+        const list = estimated.get(set.exerciseId);
+        const best = list ? list[list.length - 1].value : -Infinity;
+        if (estimate.value > best) {
+          push(estimated, set.exerciseId, {
+            dateISO,
+            value: estimate.value,
+            load: set.load,
+            reps: set.reps,
+            rpe: set.rpe ?? null,
+          });
+        }
+      }
+    }
+  }
+
+  return {
+    heaviest: Object.fromEntries(heaviest),
+    estimated: Object.fromEntries(estimated),
+  };
+}
+
+/** Records, by concrete category rather than a wall of derived e1RM dots. */
+export function records(sets, { exercises, logs }) {
+  const byLog = new Map(logs.map((log) => [log.id, log]));
+  const heaviest = new Map();
+  const bestEstimate = new Map();
+
+  for (const set of sets || []) {
+    if (set.deletedAtISO || set.load == null || !set.reps) continue;
+    // A set the lifter marked as form breakdown happened, counts as volume and
+    // stays in the Log — but it may not claim a record. A ground-out rep with a
+    // bounce is not the same lift as the one the record would be compared with.
+    if (set.formBreakdown) continue;
+    const exercise = exercises[set.exerciseId];
+    if (!exercise) continue;
+    const log = byLog.get(set.sessionLogId);
+    const dateISO = (log?.localDate || log?.dateISO || '').slice(0, 10);
+    if (!dateISO) continue;
+
+    // Heaviest load ever handled, for any rep count. True of every exercise.
+    const heavy = heaviest.get(set.exerciseId);
+    if (!heavy || set.load > heavy.load) {
+      heaviest.set(set.exerciseId, {
+        exerciseId: set.exerciseId,
+        name: exercise.name,
+        load: set.load,
+        reps: set.reps,
+        rpe: set.rpe ?? null,
+        dateISO,
+      });
+    }
+
+    // Estimated max, only where the estimate means something.
+    if (set.isIndexSet && exercise.maxConf === 'high') {
+      const estimate = estimateForSet(set);
+      if (isHighConfidence(estimate)) {
+        const best = bestEstimate.get(set.exerciseId);
+        if (!best || estimate.value > best.value) {
+          bestEstimate.set(set.exerciseId, {
+            exerciseId: set.exerciseId, name: exercise.name, value: estimate.value,
+            load: set.load, reps: set.reps, rpe: set.rpe ?? null, dateISO,
+          });
+        }
+      }
+    }
+  }
+
+  return {
+    heaviest: [...heaviest.values()].sort((a, b) => b.dateISO.localeCompare(a.dateISO)),
+    estimated: [...bestEstimate.values()].sort((a, b) => b.dateISO.localeCompare(a.dateISO)),
+  };
+}
+
+/**
+ * The best estimated max ever recorded for every exercise, in one list.
+ *
+ * Deliberately a looser question than `records()`. That one answers "what may
+ * claim a personal record", so it counts only index sets on lifts whose max is
+ * trustworthy — which is the right bar for a record and the wrong bar for
+ * "what is my best ever on the leg press". This answers the second question,
+ * and carries the confidence along rather than quietly mixing the two.
+ *
+ * Every row says how many sets it had to choose from and how many were thrown
+ * away, with the reason. A best-ever from one estimable set out of thirty is a
+ * different claim from one out of thirty, and the screen should be able to say
+ * so.
+ */
+export function bestEstimates(sets, { exercises, logs, bodyweight = 0 } = {}) {
+  const byLog = new Map((logs || []).map((log) => [log.id, log]));
+  const rows = new Map();
+
+  const row = (id, name) => {
+    if (!rows.has(id)) {
+      rows.set(id, {
+        exerciseId: id, name, value: null, load: null, reps: null, rpe: null, dateISO: null,
+        confidence: null, samples: 0, estimable: 0, excluded: [],
+      });
+    }
+    return rows.get(id);
+  };
+
+  for (const set of sets || []) {
+    if (set.deletedAtISO) continue;
+    const exercise = exercises[set.exerciseId];
+    if (!exercise) continue;
+
+    const here = row(set.exerciseId, exercise.name);
+    here.samples += 1;
+
+    if (set.formBreakdown) {
+      if (!here.excluded.includes('form breakdown')) here.excluded.push('form breakdown');
+      continue;
+    }
+
+    const estimate = estimateForSet(set, { bodyweight: exercise.bodyweightLoaded ? bodyweight : 0 });
+    if (!estimate?.value) {
+      const why = noEstimateReason(set.load, set.reps, set.rpe, { short: true });
+      if (why && !here.excluded.includes(why)) here.excluded.push(why);
+      continue;
+    }
+
+    here.estimable += 1;
+    if (here.value != null && estimate.value <= here.value) continue;
+
+    const log = byLog.get(set.sessionLogId);
+    here.value = estimate.value;
+    here.load = set.load;
+    here.reps = set.reps;
+    here.rpe = set.rpe ?? null;
+    here.confidence = estimate.confidence;
+    here.dateISO = (log?.localDate || log?.dateISO || '').slice(0, 10) || null;
+  }
+
+  return [...rows.values()]
+    .filter((entry) => entry.value != null)
+    .sort((a, b) => b.value - a.value);
+}
+
+/**
+ * Everything you have written down about one exercise, most recent first.
+ *
+ * Two kinds of note exist and both matter at the moment you are about to lift:
+ * the exercise note ("machine chest-supported row, seat height 8") and the set
+ * notes. Neither was reachable from the Train screen, so the seat height you
+ * worked out last week was in the app and not in front of you.
+ *
+ * Exercise notes are stored on the session log under their slot index, because
+ * that is what the screen knows. Resolving a slot index back to an exercise for
+ * a session finished weeks ago is done from `exerciseNoteIds` where the session
+ * recorded it, and otherwise from a set logged at that slot — sets carry their
+ * exercise, so a session with any logged work can always be resolved.
+ */
+export function exerciseNoteHistory(logs, sets, exerciseId, { limit = 6 } = {}) {
+  if (!exerciseId) return [];
+  const out = [];
+
+  const setsByLog = new Map();
+  for (const set of sets || []) {
+    if (!setsByLog.has(set.sessionLogId)) setsByLog.set(set.sessionLogId, []);
+    setsByLog.get(set.sessionLogId).push(set);
+  }
+
+  for (const log of logs || []) {
+    const attached = setsByLog.get(log.id) || [];
+    const notes = log.deviations?.exerciseNotes || {};
+    const ids = log.deviations?.exerciseNoteIds || {};
+
+    for (const [slotIndex, text] of Object.entries(notes)) {
+      if (!text) continue;
+      const resolved =
+        ids[slotIndex] || attached.find((set) => String(set.slotIndex) === String(slotIndex))?.exerciseId || null;
+      if (resolved !== exerciseId) continue;
+      out.push({ dateISO: log.dateISO, sessionId: log.sessionId, kind: 'exercise', text });
+    }
+
+    for (const set of attached) {
+      if (set.exerciseId !== exerciseId || !set.note) continue;
+      out.push({
+        dateISO: log.dateISO,
+        sessionId: log.sessionId,
+        kind: 'set',
+        text: set.note,
+        setIndex: set.setIndex,
+      });
+    }
+  }
+
+  return out
+    .sort((a, b) => b.dateISO.localeCompare(a.dateISO) || (a.setIndex ?? -1) - (b.setIndex ?? -1))
+    .slice(0, limit);
+}
